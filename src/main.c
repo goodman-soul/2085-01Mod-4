@@ -384,6 +384,75 @@ static int db_init(void) {
         "CREATE INDEX IF NOT EXISTS idx_movements_created_at ON "
         "stock_movements(created_at);"
 
+        "CREATE TABLE IF NOT EXISTS departments ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  name TEXT NOT NULL UNIQUE,"
+        "  contact_person_enc TEXT,"
+        "  contact_phone_enc TEXT,"
+        "  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive')),"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS department_accounts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  department_id INTEGER NOT NULL UNIQUE,"
+        "  monthly_quota_quantity INTEGER NOT NULL DEFAULT 0 CHECK(monthly_quota_quantity >= 0),"
+        "  monthly_quota_cents INTEGER NOT NULL DEFAULT 0 CHECK(monthly_quota_cents >= 0),"
+        "  unit_price_cents INTEGER NOT NULL DEFAULT 0 CHECK(unit_price_cents >= 0),"
+        "  billing_cycle TEXT NOT NULL DEFAULT 'monthly' CHECK(billing_cycle IN ('monthly')),"
+        "  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(department_id) REFERENCES departments(id) ON DELETE CASCADE"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS pickup_codes ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  code TEXT NOT NULL UNIQUE,"
+        "  department_id INTEGER NOT NULL,"
+        "  account_id INTEGER NOT NULL,"
+        "  sku TEXT NOT NULL,"
+        "  quantity INTEGER NOT NULL CHECK(quantity > 0),"
+        "  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','used','expired','cancelled')),"
+        "  expires_at INTEGER,"
+        "  used_at TEXT,"
+        "  used_by_user_id INTEGER,"
+        "  created_by_user_id INTEGER NOT NULL,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(department_id) REFERENCES departments(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(account_id) REFERENCES department_accounts(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(used_by_user_id) REFERENCES users(id),"
+        "  FOREIGN KEY(created_by_user_id) REFERENCES users(id)"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS department_pickups ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  department_id INTEGER NOT NULL,"
+        "  account_id INTEGER NOT NULL,"
+        "  pickup_code_id INTEGER NOT NULL UNIQUE,"
+        "  product_id INTEGER NOT NULL,"
+        "  sku TEXT NOT NULL,"
+        "  quantity INTEGER NOT NULL CHECK(quantity > 0),"
+        "  unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents >= 0),"
+        "  total_amount_cents INTEGER NOT NULL CHECK(total_amount_cents >= 0),"
+        "  billing_month TEXT NOT NULL,"
+        "  picked_by_user_id INTEGER,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(department_id) REFERENCES departments(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(account_id) REFERENCES department_accounts(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(pickup_code_id) REFERENCES pickup_codes(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(product_id) REFERENCES products(id),"
+        "  FOREIGN KEY(picked_by_user_id) REFERENCES users(id)"
+        ");"
+
+        "CREATE INDEX IF NOT EXISTS idx_departments_name ON departments(name);"
+        "CREATE INDEX IF NOT EXISTS idx_accounts_department_id ON department_accounts(department_id);"
+        "CREATE INDEX IF NOT EXISTS idx_pickup_codes_code ON pickup_codes(code);"
+        "CREATE INDEX IF NOT EXISTS idx_pickup_codes_department_id ON pickup_codes(department_id);"
+        "CREATE INDEX IF NOT EXISTS idx_pickups_department_id ON department_pickups(department_id);"
+        "CREATE INDEX IF NOT EXISTS idx_pickups_billing_month ON department_pickups(billing_month);"
+
         "INSERT OR IGNORE INTO products (sku, name, unit, stock_quantity) VALUES "
         "('SEED-WATER-550', '系统示例矿泉水550ml', '瓶', 50);";
 
@@ -1743,6 +1812,1141 @@ static enum MHD_Result handle_movements(struct MHD_Connection *connection) {
     return respond_success(connection, MHD_HTTP_OK, items);
 }
 
+static void get_current_billing_month(char out[8]) {
+    time_t t = now_epoch();
+    struct tm *tm_info = localtime(&t);
+    strftime(out, 8, "%Y-%m", tm_info);
+}
+
+static int parse_int_query(struct MHD_Connection *connection, const char *key, int *out) {
+    const char *s = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, key);
+    if (s == NULL || *s == '\0') {
+        return -1;
+    }
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return -1;
+    }
+    if (v < 0 || v > INT_MAX) {
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+static int generate_pickup_code(char *out, size_t out_size) {
+    if (out_size < 9) {
+        return -1;
+    }
+    unsigned char raw[4];
+    randombytes_buf(raw, sizeof(raw));
+    snprintf(out, out_size, "%02X%02X%02X%02X",
+             raw[0], raw[1], raw[2], raw[3]);
+    return 0;
+}
+
+static enum MHD_Result handle_create_department(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *name = NULL;
+    if (require_string_field(body, "name", 128, &name) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "name 必填，长度不超过128");
+    }
+
+    const char *contact_person = optional_string_field(body, "contact_person", 128);
+    const char *contact_phone = optional_string_field(body, "contact_phone", 64);
+    if (contact_person == NULL || contact_phone == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "contact_person/contact_phone 必须是字符串且长度合法");
+    }
+
+    char name_copy[129];
+    snprintf(name_copy, sizeof(name_copy), "%s", name);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可创建部门");
+    }
+
+    char *cp_enc = NULL;
+    char *cphone_enc = NULL;
+    if (encrypt_text(contact_person, &cp_enc) != 0 ||
+        encrypt_text(contact_phone, &cphone_enc) != 0) {
+        free(cp_enc);
+        free(cphone_enc);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "SECURITY_ERROR", "联系人信息加密失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO departments (name, contact_person_enc, contact_phone_enc) "
+        "VALUES (?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(cp_enc);
+        free(cphone_enc);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建部门预编译失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, name_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, cp_enc, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, cphone_enc, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    free(cp_enc);
+    free(cphone_enc);
+
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        if (rc == SQLITE_CONSTRAINT) {
+            return respond_error(connection, MHD_HTTP_CONFLICT, "CONFLICT",
+                                "部门名称已存在");
+        }
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建部门失败");
+    }
+
+    int dept_id = (int)sqlite3_last_insert_rowid(g_db);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "id", json_integer(dept_id));
+    json_object_set_new(data, "name", json_string(name_copy));
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_departments(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id, name, contact_person_enc, contact_phone_enc, status, "
+        "created_at, updated_at FROM departments ORDER BY id DESC;";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询部门列表失败");
+    }
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *it = json_object();
+        int id = sqlite3_column_int(stmt, 0);
+        const char *cp_enc = safe_col_text(stmt, 2);
+        const char *cphone_enc = safe_col_text(stmt, 3);
+        char *cp = NULL;
+        char *cphone = NULL;
+        decrypt_text(cp_enc, &cp);
+        decrypt_text(cphone_enc, &cphone);
+
+        json_object_set_new(it, "id", json_integer(id));
+        json_object_set_new(it, "name", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "contact_person", json_string(cp ? cp : ""));
+        json_object_set_new(it, "contact_phone", json_string(cphone ? cphone : ""));
+        json_object_set_new(it, "status", json_string(safe_col_text(stmt, 4)));
+        json_object_set_new(it, "created_at", json_string(safe_col_text(stmt, 5)));
+        json_object_set_new(it, "updated_at", json_string(safe_col_text(stmt, 6)));
+        json_array_append_new(items, it);
+
+        free(cp);
+        free(cphone);
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取部门列表失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_upsert_department_account(struct MHD_Connection *connection,
+                                                         ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    int department_id = 0;
+    int monthly_quota_quantity = 0;
+    int unit_price_cents = 0;
+    if (parse_int_field(body, "department_id", 1, INT_MAX, &department_id) != 0 ||
+        parse_int_field(body, "monthly_quota_quantity", 0, 1000000, &monthly_quota_quantity) != 0 ||
+        parse_int_field(body, "unit_price_cents", 0, 1000000, &unit_price_cents) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "department_id/monthly_quota_quantity/unit_price_cents 必填且为合法整数");
+    }
+
+    const char *status_input = optional_string_field(body, "status", 16);
+    if (status_input == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "status 必须是字符串");
+    }
+    const char *status = "active";
+    if (status_input != NULL && *status_input != '\0') {
+        if (strcmp(status_input, "active") != 0 && strcmp(status_input, "suspended") != 0) {
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                                "status 仅支持 active/suspended");
+        }
+        status = status_input;
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可操作部门账户");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *check_sql = "SELECT id FROM departments WHERE id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, check_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询部门失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "部门不存在");
+    }
+
+    int monthly_quota_cents = monthly_quota_quantity * unit_price_cents;
+
+    const char *upsert_sql =
+        "INSERT INTO department_accounts "
+        "(department_id, monthly_quota_quantity, monthly_quota_cents, unit_price_cents, status) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(department_id) DO UPDATE SET "
+        "  monthly_quota_quantity = excluded.monthly_quota_quantity,"
+        "  monthly_quota_cents = excluded.monthly_quota_cents,"
+        "  unit_price_cents = excluded.unit_price_cents,"
+        "  status = excluded.status,"
+        "  updated_at = CURRENT_TIMESTAMP;";
+    if (sqlite3_prepare_v2(g_db, upsert_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "账户更新预编译失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    sqlite3_bind_int(stmt, 2, monthly_quota_quantity);
+    sqlite3_bind_int(stmt, 3, monthly_quota_cents);
+    sqlite3_bind_int(stmt, 4, unit_price_cents);
+    sqlite3_bind_text(stmt, 5, status, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "账户更新失败");
+    }
+
+    int account_id = 0;
+    const char *id_sql = "SELECT id FROM department_accounts WHERE department_id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, id_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询账户ID失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        account_id = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "id", json_integer(account_id));
+    json_object_set_new(data, "department_id", json_integer(department_id));
+    json_object_set_new(data, "monthly_quota_quantity", json_integer(monthly_quota_quantity));
+    json_object_set_new(data, "monthly_quota_cents", json_integer(monthly_quota_cents));
+    json_object_set_new(data, "unit_price_cents", json_integer(unit_price_cents));
+    json_object_set_new(data, "status", json_string(status));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_get_department_account(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    int department_id = 0;
+    if (parse_int_query(connection, "department_id", &department_id) != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "department_id 查询参数必填且为合法整数");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT a.id, a.department_id, d.name, a.monthly_quota_quantity, "
+        "a.monthly_quota_cents, a.unit_price_cents, a.status, "
+        "a.created_at, a.updated_at "
+        "FROM department_accounts a "
+        "JOIN departments d ON d.id = a.department_id "
+        "WHERE a.department_id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询账户失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "该部门尚未开户");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "id", json_integer(sqlite3_column_int(stmt, 0)));
+    json_object_set_new(data, "department_id", json_integer(sqlite3_column_int(stmt, 1)));
+    json_object_set_new(data, "department_name", json_string(safe_col_text(stmt, 2)));
+    json_object_set_new(data, "monthly_quota_quantity", json_integer(sqlite3_column_int(stmt, 3)));
+    json_object_set_new(data, "monthly_quota_cents", json_integer(sqlite3_column_int(stmt, 4)));
+    json_object_set_new(data, "unit_price_cents", json_integer(sqlite3_column_int(stmt, 5)));
+    json_object_set_new(data, "status", json_string(safe_col_text(stmt, 6)));
+    json_object_set_new(data, "created_at", json_string(safe_col_text(stmt, 7)));
+    json_object_set_new(data, "updated_at", json_string(safe_col_text(stmt, 8)));
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_create_pickup_code(struct MHD_Connection *connection,
+                                                 ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    int department_id = 0;
+    int quantity = 0;
+    if (parse_int_field(body, "department_id", 1, INT_MAX, &department_id) != 0 ||
+        parse_int_field(body, "quantity", 1, 1000, &quantity) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "department_id/quantity 必填且为合法整数");
+    }
+
+    const char *sku = NULL;
+    if (require_string_field(body, "sku", 64, &sku) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "sku 必填");
+    }
+
+    int ttl_hours = 0;
+    json_t *ttl_v = json_object_get(body, "ttl_hours");
+    if (ttl_v != NULL && json_is_integer(ttl_v)) {
+        json_int_t n = json_integer_value(ttl_v);
+        if (n >= 1 && n <= 24 * 30) {
+            ttl_hours = (int)n;
+        }
+    }
+
+    char sku_copy[65];
+    snprintf(sku_copy, sizeof(sku_copy), "%s", sku);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可生成取货码");
+    }
+
+    if (begin_transaction() != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "开启事务失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int account_id = 0;
+    int unit_price_cents = 0;
+    int monthly_quota_quantity = 0;
+    const char *account_status = NULL;
+    char billing_month[8] = {0};
+    get_current_billing_month(billing_month);
+
+    const char *acc_sql =
+        "SELECT a.id, a.unit_price_cents, a.monthly_quota_quantity, a.status "
+        "FROM department_accounts a WHERE a.department_id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, acc_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询账户失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "该部门尚未开户");
+    }
+    account_id = sqlite3_column_int(stmt, 0);
+    unit_price_cents = sqlite3_column_int(stmt, 1);
+    monthly_quota_quantity = sqlite3_column_int(stmt, 2);
+    account_status = safe_col_text(stmt, 3);
+    sqlite3_finalize(stmt);
+
+    if (strcmp(account_status, "active") != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "ACCOUNT_SUSPENDED",
+                            "部门账户已暂停");
+    }
+
+    int used_qty = 0;
+    const char *used_sql =
+        "SELECT COALESCE(SUM(quantity), 0) FROM department_pickups "
+        "WHERE department_id = ? AND billing_month = ?;";
+    if (sqlite3_prepare_v2(g_db, used_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询已用额度失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    sqlite3_bind_text(stmt, 2, billing_month, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        used_qty = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    int pending_qty = 0;
+    const char *pending_sql =
+        "SELECT COALESCE(SUM(quantity), 0) FROM pickup_codes "
+        "WHERE department_id = ? AND status = 'active';";
+    if (sqlite3_prepare_v2(g_db, pending_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询待使用取货码失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        pending_qty = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    if (used_qty + pending_qty + quantity > monthly_quota_quantity) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "QUOTA_EXCEEDED",
+                            "月度额度不足");
+    }
+
+    int product_id = 0;
+    int current_stock = 0;
+    const char *prod_sql = "SELECT id, stock_quantity FROM products WHERE sku = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, prod_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询商品失败");
+    }
+    sqlite3_bind_text(stmt, 1, sku_copy, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "商品不存在");
+    }
+    product_id = sqlite3_column_int(stmt, 0);
+    current_stock = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    (void)current_stock;
+    (void)product_id;
+
+    char code[16] = {0};
+    int code_ok = 0;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (generate_pickup_code(code, sizeof(code)) != 0) {
+            break;
+        }
+        const char *exist_sql = "SELECT id FROM pickup_codes WHERE code = ? LIMIT 1;";
+        if (sqlite3_prepare_v2(g_db, exist_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            break;
+        }
+        sqlite3_bind_text(stmt, 1, code, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_ROW) {
+            code_ok = 1;
+            break;
+        }
+    }
+    if (!code_ok) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "CODE_GENERATE_FAILED", "生成取货码失败");
+    }
+
+    sqlite3_int64 expires_at = 0;
+    if (ttl_hours > 0) {
+        expires_at = (sqlite3_int64)now_epoch() + (sqlite3_int64)ttl_hours * 3600;
+    }
+
+    const char *ins_sql =
+        "INSERT INTO pickup_codes "
+        "(code, department_id, account_id, sku, quantity, expires_at, created_by_user_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, ins_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入取货码失败");
+    }
+    sqlite3_bind_text(stmt, 1, code, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, department_id);
+    sqlite3_bind_int(stmt, 3, account_id);
+    sqlite3_bind_text(stmt, 4, sku_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, quantity);
+    if (expires_at > 0) {
+        sqlite3_bind_int64(stmt, 6, expires_at);
+    } else {
+        sqlite3_bind_null(stmt, 6);
+    }
+    sqlite3_bind_int(stmt, 7, user.user_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE || commit_transaction() != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "生成取货码失败");
+    }
+
+    int code_id = (int)sqlite3_last_insert_rowid(g_db);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "id", json_integer(code_id));
+    json_object_set_new(data, "code", json_string(code));
+    json_object_set_new(data, "department_id", json_integer(department_id));
+    json_object_set_new(data, "sku", json_string(sku_copy));
+    json_object_set_new(data, "quantity", json_integer(quantity));
+    json_object_set_new(data, "unit_price_cents", json_integer(unit_price_cents));
+    json_object_set_new(data, "status", json_string("active"));
+    if (expires_at > 0) {
+        json_object_set_new(data, "expires_at", json_integer((json_int_t)expires_at));
+    }
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_pickup_codes(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    int department_id = 0;
+    int has_dept_filter = (parse_int_query(connection, "department_id", &department_id) == 0);
+
+    int limit = parse_limit_query(connection);
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql_all =
+        "SELECT c.id, c.code, c.department_id, d.name, c.sku, c.quantity, "
+        "c.status, c.expires_at, c.used_at, u.username, c.created_at "
+        "FROM pickup_codes c "
+        "JOIN departments d ON d.id = c.department_id "
+        "LEFT JOIN users u ON u.id = c.used_by_user_id "
+        "ORDER BY c.id DESC LIMIT ?;";
+    const char *sql_dept =
+        "SELECT c.id, c.code, c.department_id, d.name, c.sku, c.quantity, "
+        "c.status, c.expires_at, c.used_at, u.username, c.created_at "
+        "FROM pickup_codes c "
+        "JOIN departments d ON d.id = c.department_id "
+        "LEFT JOIN users u ON u.id = c.used_by_user_id "
+        "WHERE c.department_id = ? "
+        "ORDER BY c.id DESC LIMIT ?;";
+
+    if (sqlite3_prepare_v2(g_db, has_dept_filter ? sql_dept : sql_all, -1, &stmt, NULL) !=
+        SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询取货码失败");
+    }
+    int idx = 1;
+    if (has_dept_filter) {
+        sqlite3_bind_int(stmt, idx++, department_id);
+    }
+    sqlite3_bind_int(stmt, idx, limit);
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *it = json_object();
+        json_object_set_new(it, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(it, "code", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(it, "department_id", json_integer(sqlite3_column_int(stmt, 2)));
+        json_object_set_new(it, "department_name", json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(it, "sku", json_string(safe_col_text(stmt, 4)));
+        json_object_set_new(it, "quantity", json_integer(sqlite3_column_int(stmt, 5)));
+        json_object_set_new(it, "status", json_string(safe_col_text(stmt, 6)));
+        if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+            json_object_set_new(it, "expires_at", json_integer(sqlite3_column_int64(stmt, 7)));
+        }
+        const char *used_at = safe_col_text(stmt, 8);
+        if (*used_at != '\0') {
+            json_object_set_new(it, "used_at", json_string(used_at));
+            json_object_set_new(it, "used_by", json_string(safe_col_text(stmt, 9)));
+        }
+        json_object_set_new(it, "created_at", json_string(safe_col_text(stmt, 10)));
+        json_array_append_new(items, it);
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取取货码失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_department_pickup(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *code = NULL;
+    if (require_string_field(body, "code", 32, &code) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "code 必填");
+    }
+
+    char code_copy[33];
+    snprintf(code_copy, sizeof(code_copy), "%s", code);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    int has_auth = authenticate_request(connection, &user, token_hash);
+
+    if (begin_transaction() != 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "开启事务失败");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int code_id = 0;
+    int department_id = 0;
+    int account_id = 0;
+    int quantity = 0;
+    int unit_price_cents = 0;
+    const char *sku = NULL;
+    const char *status = NULL;
+    sqlite3_int64 expires_at = 0;
+
+    const char *code_sql =
+        "SELECT c.id, c.department_id, c.account_id, c.sku, c.quantity, "
+        "c.status, c.expires_at, a.unit_price_cents "
+        "FROM pickup_codes c "
+        "JOIN department_accounts a ON a.id = c.account_id "
+        "WHERE c.code = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, code_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询取货码失败");
+    }
+    sqlite3_bind_text(stmt, 1, code_copy, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "取货码不存在");
+    }
+    code_id = sqlite3_column_int(stmt, 0);
+    department_id = sqlite3_column_int(stmt, 1);
+    account_id = sqlite3_column_int(stmt, 2);
+    sku = safe_col_text(stmt, 3);
+    quantity = sqlite3_column_int(stmt, 4);
+    status = safe_col_text(stmt, 5);
+    if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+        expires_at = sqlite3_column_int64(stmt, 6);
+    }
+    unit_price_cents = sqlite3_column_int(stmt, 7);
+    sqlite3_finalize(stmt);
+
+    if (strcmp(status, "active") != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "INVALID_CODE_STATUS",
+                            "取货码不可用");
+    }
+
+    if (expires_at > 0 && (sqlite3_int64)now_epoch() > expires_at) {
+        const char *exp_sql = "UPDATE pickup_codes SET status = 'expired' WHERE id = ?;";
+        if (sqlite3_prepare_v2(g_db, exp_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, code_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "CODE_EXPIRED",
+                            "取货码已过期");
+    }
+
+    int product_id = 0;
+    int current_stock = 0;
+    const char *prod_sql = "SELECT id, stock_quantity FROM products WHERE sku = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, prod_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询商品失败");
+    }
+    sqlite3_bind_text(stmt, 1, sku, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "商品不存在");
+    }
+    product_id = sqlite3_column_int(stmt, 0);
+    current_stock = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+
+    if (current_stock < quantity) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "INSUFFICIENT_STOCK",
+                            "库存不足");
+    }
+
+    char billing_month[8] = {0};
+    get_current_billing_month(billing_month);
+
+    int monthly_quota = 0;
+    const char *quota_sql =
+        "SELECT monthly_quota_quantity FROM department_accounts WHERE id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, quota_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询额度失败");
+    }
+    sqlite3_bind_int(stmt, 1, account_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        monthly_quota = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    int used_qty = 0;
+    const char *used_sql =
+        "SELECT COALESCE(SUM(quantity), 0) FROM department_pickups "
+        "WHERE department_id = ? AND billing_month = ?;";
+    if (sqlite3_prepare_v2(g_db, used_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询已用额度失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    sqlite3_bind_text(stmt, 2, billing_month, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        used_qty = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    if (used_qty + quantity > monthly_quota) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_CONFLICT, "QUOTA_EXCEEDED",
+                            "月度额度已用完");
+    }
+
+    const char *upd_stock_sql =
+        "UPDATE products SET stock_quantity = stock_quantity - ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?;";
+    if (sqlite3_prepare_v2(g_db, upd_stock_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "扣减库存失败");
+    }
+    sqlite3_bind_int(stmt, 1, quantity);
+    sqlite3_bind_int(stmt, 2, product_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "扣减库存失败");
+    }
+
+    const char *mov_sql =
+        "INSERT INTO stock_movements "
+        "(product_id, movement_type, quantity, unit_price_cents, note, operator_user_id) "
+        "VALUES (?, 'OUT', ?, ?, '部门团购取货', ?);";
+    if (sqlite3_prepare_v2(g_db, mov_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入库存流水失败");
+    }
+    sqlite3_bind_int(stmt, 1, product_id);
+    sqlite3_bind_int(stmt, 2, quantity);
+    sqlite3_bind_int(stmt, 3, unit_price_cents);
+    sqlite3_bind_int(stmt, 4, has_auth ? user.user_id : 1);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入库存流水失败");
+    }
+
+    const char *upd_code_sql =
+        "UPDATE pickup_codes SET status = 'used', used_at = CURRENT_TIMESTAMP, "
+        "used_by_user_id = ? WHERE id = ?;";
+    if (sqlite3_prepare_v2(g_db, upd_code_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新取货码失败");
+    }
+    sqlite3_bind_int(stmt, 1, has_auth ? user.user_id : 1);
+    sqlite3_bind_int(stmt, 2, code_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新取货码失败");
+    }
+
+    int total_amount = quantity * unit_price_cents;
+    const char *pickup_sql =
+        "INSERT INTO department_pickups "
+        "(department_id, account_id, pickup_code_id, product_id, sku, quantity, "
+        "unit_price_cents, total_amount_cents, billing_month, picked_by_user_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, pickup_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "写入取水记录失败");
+    }
+    sqlite3_bind_int(stmt, 1, department_id);
+    sqlite3_bind_int(stmt, 2, account_id);
+    sqlite3_bind_int(stmt, 3, code_id);
+    sqlite3_bind_int(stmt, 4, product_id);
+    sqlite3_bind_text(stmt, 5, sku, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, quantity);
+    sqlite3_bind_int(stmt, 7, unit_price_cents);
+    sqlite3_bind_int(stmt, 8, total_amount);
+    sqlite3_bind_text(stmt, 9, billing_month, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 10, has_auth ? user.user_id : 1);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE || commit_transaction() != 0) {
+        rollback_transaction();
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "取水事务提交失败");
+    }
+
+    int new_stock = current_stock - quantity;
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "department_id", json_integer(department_id));
+    json_object_set_new(data, "sku", json_string(sku));
+    json_object_set_new(data, "quantity", json_integer(quantity));
+    json_object_set_new(data, "unit_price_cents", json_integer(unit_price_cents));
+    json_object_set_new(data, "total_amount_cents", json_integer(total_amount));
+    json_object_set_new(data, "billing_month", json_string(billing_month));
+    json_object_set_new(data, "remaining_stock", json_integer(new_stock));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_monthly_report(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可查看月结报表");
+    }
+
+    char billing_month[8] = {0};
+    const char *m = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "month");
+    if (m != NULL && *m != '\0' && strlen(m) == 7 && m[4] == '-') {
+        snprintf(billing_month, sizeof(billing_month), "%s", m);
+    } else {
+        get_current_billing_month(billing_month);
+    }
+
+    int dept_filter = 0;
+    int has_dept = (parse_int_query(connection, "department_id", &dept_filter) == 0);
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql_all =
+        "SELECT d.id, d.name, a.monthly_quota_quantity, a.monthly_quota_cents, "
+        "a.unit_price_cents, a.status, "
+        "COALESCE(SUM(p.quantity), 0) AS used_quantity, "
+        "COALESCE(SUM(p.total_amount_cents), 0) AS used_amount "
+        "FROM departments d "
+        "LEFT JOIN department_accounts a ON a.department_id = d.id "
+        "LEFT JOIN department_pickups p ON p.department_id = d.id AND p.billing_month = ? "
+        "GROUP BY d.id, d.name, a.monthly_quota_quantity, a.monthly_quota_cents, "
+        "a.unit_price_cents, a.status "
+        "ORDER BY d.id ASC;";
+    const char *sql_dept =
+        "SELECT d.id, d.name, a.monthly_quota_quantity, a.monthly_quota_cents, "
+        "a.unit_price_cents, a.status, "
+        "COALESCE(SUM(p.quantity), 0) AS used_quantity, "
+        "COALESCE(SUM(p.total_amount_cents), 0) AS used_amount "
+        "FROM departments d "
+        "LEFT JOIN department_accounts a ON a.department_id = d.id "
+        "LEFT JOIN department_pickups p ON p.department_id = d.id AND p.billing_month = ? "
+        "WHERE d.id = ? "
+        "GROUP BY d.id, d.name, a.monthly_quota_quantity, a.monthly_quota_cents, "
+        "a.unit_price_cents, a.status;";
+
+    if (sqlite3_prepare_v2(g_db, has_dept ? sql_dept : sql_all, -1, &stmt, NULL) !=
+        SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询月结报表失败");
+    }
+    sqlite3_bind_text(stmt, 1, billing_month, -1, SQLITE_TRANSIENT);
+    if (has_dept) {
+        sqlite3_bind_int(stmt, 2, dept_filter);
+    }
+
+    json_t *items = json_array();
+    int grand_total_quota_qty = 0;
+    int grand_total_quota_cents = 0;
+    int grand_total_used_qty = 0;
+    int grand_total_used_cents = 0;
+
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt, 0);
+        const char *name = safe_col_text(stmt, 1);
+        int quota_qty = sqlite3_column_int(stmt, 2);
+        int quota_cents = sqlite3_column_int(stmt, 3);
+        int unit_price = sqlite3_column_int(stmt, 4);
+        const char *status = safe_col_text(stmt, 5);
+        int used_qty = sqlite3_column_int(stmt, 6);
+        int used_cents = sqlite3_column_int(stmt, 7);
+        int remaining_qty = quota_qty - used_qty;
+        if (remaining_qty < 0) remaining_qty = 0;
+        int remaining_cents = quota_cents - used_cents;
+        if (remaining_cents < 0) remaining_cents = 0;
+        int receivable_cents = used_cents;
+
+        json_t *it = json_object();
+        json_object_set_new(it, "department_id", json_integer(id));
+        json_object_set_new(it, "department_name", json_string(name));
+        json_object_set_new(it, "billing_month", json_string(billing_month));
+        json_object_set_new(it, "monthly_quota_quantity", json_integer(quota_qty));
+        json_object_set_new(it, "monthly_quota_cents", json_integer(quota_cents));
+        json_object_set_new(it, "unit_price_cents", json_integer(unit_price));
+        json_object_set_new(it, "used_quantity", json_integer(used_qty));
+        json_object_set_new(it, "used_amount_cents", json_integer(used_cents));
+        json_object_set_new(it, "remaining_quantity", json_integer(remaining_qty));
+        json_object_set_new(it, "remaining_amount_cents", json_integer(remaining_cents));
+        json_object_set_new(it, "receivable_amount_cents", json_integer(receivable_cents));
+        json_object_set_new(it, "account_status", json_string(status));
+        json_array_append_new(items, it);
+
+        grand_total_quota_qty += quota_qty;
+        grand_total_quota_cents += quota_cents;
+        grand_total_used_qty += used_qty;
+        grand_total_used_cents += used_cents;
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取月结报表失败");
+    }
+
+    json_t *summary = json_object();
+    json_object_set_new(summary, "billing_month", json_string(billing_month));
+    json_object_set_new(summary, "total_quota_quantity", json_integer(grand_total_quota_qty));
+    json_object_set_new(summary, "total_quota_cents", json_integer(grand_total_quota_cents));
+    json_object_set_new(summary, "total_used_quantity", json_integer(grand_total_used_qty));
+    json_object_set_new(summary, "total_used_cents", json_integer(grand_total_used_cents));
+    json_object_set_new(summary, "total_receivable_cents", json_integer(grand_total_used_cents));
+    json_object_set_new(summary, "total_remaining_quantity",
+                        json_integer(grand_total_quota_qty - grand_total_used_qty > 0
+                                         ? grand_total_quota_qty - grand_total_used_qty
+                                         : 0));
+    json_object_set_new(summary, "total_remaining_cents",
+                        json_integer(grand_total_quota_cents - grand_total_used_cents > 0
+                                         ? grand_total_quota_cents - grand_total_used_cents
+                                         : 0));
+
+    json_t *data = json_object();
+    json_object_set_new(data, "summary", summary);
+    json_object_set_new(data, "departments", items);
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
 static enum MHD_Result route_health(struct MHD_Connection *connection,
                                     ConnectionInfo *ci) {
     (void)ci;
@@ -1804,6 +3008,50 @@ static enum MHD_Result route_movements(struct MHD_Connection *connection,
     return handle_movements(connection);
 }
 
+static enum MHD_Result route_create_department(struct MHD_Connection *connection,
+                                               ConnectionInfo *ci) {
+    return handle_create_department(connection, ci);
+}
+
+static enum MHD_Result route_list_departments(struct MHD_Connection *connection,
+                                               ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_departments(connection);
+}
+
+static enum MHD_Result route_upsert_department_account(struct MHD_Connection *connection,
+                                                        ConnectionInfo *ci) {
+    return handle_upsert_department_account(connection, ci);
+}
+
+static enum MHD_Result route_get_department_account(struct MHD_Connection *connection,
+                                                     ConnectionInfo *ci) {
+    (void)ci;
+    return handle_get_department_account(connection);
+}
+
+static enum MHD_Result route_create_pickup_code(struct MHD_Connection *connection,
+                                                 ConnectionInfo *ci) {
+    return handle_create_pickup_code(connection, ci);
+}
+
+static enum MHD_Result route_list_pickup_codes(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_pickup_codes(connection);
+}
+
+static enum MHD_Result route_department_pickup(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    return handle_department_pickup(connection, ci);
+}
+
+static enum MHD_Result route_monthly_report(struct MHD_Connection *connection,
+                                             ConnectionInfo *ci) {
+    (void)ci;
+    return handle_monthly_report(connection);
+}
+
 static enum MHD_Result route_openapi_doc(struct MHD_Connection *connection,
                                          ConnectionInfo *ci);
 
@@ -1843,6 +3091,22 @@ static const ApiRoute g_api_routes[] = {
      "库存汇总与明细", "Inventory", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/movements", route_movements, "Movement History",
      "库存流水查询", "Inventory", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/departments", route_create_department,
+     "Create Department", "创建部门（管理员）", "GroupBuy", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/departments", route_list_departments,
+     "List Departments", "查询部门列表", "GroupBuy", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/department-accounts", route_upsert_department_account,
+     "Upsert Department Account", "开户或更新部门账户与额度（管理员）", "GroupBuy", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/department-accounts", route_get_department_account,
+     "Get Department Account", "查询部门账户（?department_id=）", "GroupBuy", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/pickup-codes", route_create_pickup_code,
+     "Create Pickup Code", "生成部门取货码（管理员）", "GroupBuy", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/pickup-codes", route_list_pickup_codes,
+     "List Pickup Codes", "查询取货码列表（?department_id=, ?limit=）", "GroupBuy", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/department-pickup", route_department_pickup,
+     "Department Pickup", "扫码使用取货码取水", "GroupBuy", 0, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/departments/monthly-report", route_monthly_report,
+     "Monthly Report", "月结报表：应收/已取/剩余额度（管理员，?month=YYYY-MM&department_id=）", "GroupBuy", 1, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/openapi.json", route_openapi_doc,
      "OpenAPI Document", "自动生成的 OpenAPI 文档", "System", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/docs", route_swagger_ui, "Swagger UI",
